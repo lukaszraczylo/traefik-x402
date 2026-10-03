@@ -1,0 +1,410 @@
+//go:build e2e
+
+// Package integration runs the plugin inside a real Traefik container against
+// a mock facilitator and upstream, using only the docker CLI.
+package integration
+
+import (
+	"bufio"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+const (
+	traefikImage = "traefik:v3.7"
+	usdc         = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+	dai          = "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"
+	payTo        = "0x209693Bc6afc0C5328bA36FaF03C514EF312287C"
+	payer        = "0x857b06519E91e3A54538791bDbb0E22373e36b66"
+)
+
+type mockFacilitator struct {
+	mu      sync.Mutex
+	verify  int
+	settle  int
+	failFor string
+}
+
+func (m *mockFacilitator) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	b, _ := io.ReadAll(r.Body)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	switch r.URL.Path {
+	case "/verify":
+		m.verify++
+		fmt.Fprintf(w, `{"isValid":true,"payer":%q}`, payer)
+	case "/settle":
+		m.settle++
+		if m.failFor != "" && strings.Contains(string(b), m.failFor) {
+			io.WriteString(w, `{"success":false,"errorReason":"insufficient_funds","transaction":"","network":"eip155:84532"}`)
+			return
+		}
+		fmt.Fprintf(w, `{"success":true,"transaction":"0xdeadbeef","network":"eip155:84532","payer":%q}`, payer)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (m *mockFacilitator) counts() (int, int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.verify, m.settle
+}
+
+func listenAll(t *testing.T, h http.Handler) (*httptest.Server, int) {
+	t.Helper()
+	l, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := httptest.NewUnstartedServer(h)
+	s.Listener = l
+	s.Start()
+	t.Cleanup(s.Close)
+	return s, l.Addr().(*net.TCPAddr).Port
+}
+
+func upstream() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/broken"):
+			http.Error(w, "upstream exploded", http.StatusInternalServerError)
+		case strings.HasSuffix(r.URL.Path, "/stream"):
+			w.Header().Set("Content-Type", "text/event-stream")
+			f := w.(http.Flusher)
+			for i := 0; i < 3; i++ {
+				fmt.Fprintf(w, "data: %d\n\n", i)
+				f.Flush()
+				time.Sleep(300 * time.Millisecond)
+			}
+		default:
+			fmt.Fprintf(w, "content for %s payer=%s sig=%q", r.URL.Path, r.Header.Get("X-Payer"), r.Header.Get("PAYMENT-SIGNATURE"))
+		}
+	})
+}
+
+func settlementMode() string {
+	if m := os.Getenv("X402_E2E_SETTLEMENT"); m != "" {
+		return m
+	}
+	return "after"
+}
+
+func dynamicConfig(facPort, upPort int) string {
+	return fmt.Sprintf(`http:
+  routers:
+    all:
+      rule: PathPrefix(`+"`/`"+`)
+      entryPoints: [web]
+      service: up
+      middlewares: [pay]
+  services:
+    up:
+      loadBalancer:
+        servers:
+          - url: http://host.docker.internal:%d
+  middlewares:
+    pay:
+      plugin:
+        x402:
+          facilitatorURL: http://host.docker.internal:%d
+          allowInsecureFacilitator: true
+          payerHeader: X-Payer
+          settlement: %s
+          description: Premium content
+          mimeType: text/plain
+          accepts:
+            - network: eip155:84532
+              amount: "10000"
+              asset: "%s"
+              payTo: "%s"
+              extra:
+                name: USDC
+                version: "2"
+            - network: eip155:84532
+              amount: "10000000000000000"
+              asset: "%s"
+              payTo: "%s"
+              extra:
+                name: Dai Stablecoin
+                version: "1"
+          exact:
+            - /report
+          prefixes:
+            - /premium/
+          suffixes:
+            - .pdf
+`, upPort, facPort, settlementMode(), usdc, payTo, dai, payTo)
+}
+
+const staticConfig = `entryPoints:
+  web:
+    address: ":80"
+experimental:
+  localPlugins:
+    x402:
+      moduleName: github.com/lukaszraczylo/traefik-x402
+providers:
+  file:
+    directory: /etc/traefik/dynamic
+log:
+  level: DEBUG
+`
+
+func startTraefik(t *testing.T, facPort, upPort int) string {
+	t.Helper()
+	repo, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	must(t, os.MkdirAll(filepath.Join(dir, "dynamic"), 0o755))
+	must(t, os.WriteFile(filepath.Join(dir, "traefik.yml"), []byte(staticConfig), 0o644))
+	must(t, os.WriteFile(filepath.Join(dir, "dynamic", "x402.yml"), []byte(dynamicConfig(facPort, upPort)), 0o644))
+	name := fmt.Sprintf("x402-e2e-%d", time.Now().UnixNano())
+	out, err := exec.Command("docker", "run", "-d", "--rm", "--name", name,
+		"--add-host", "host.docker.internal:host-gateway", "-p", "127.0.0.1::80",
+		"-v", repo+":/plugins-local/src/github.com/lukaszraczylo/traefik-x402:ro",
+		"-v", filepath.Join(dir, "traefik.yml")+":/etc/traefik/traefik.yml:ro",
+		"-v", filepath.Join(dir, "dynamic")+":/etc/traefik/dynamic:ro",
+		traefikImage, "--configfile=/etc/traefik/traefik.yml").CombinedOutput()
+	if err != nil {
+		t.Fatalf("docker run: %v\n%s", err, out)
+	}
+	t.Cleanup(func() {
+		if t.Failed() {
+			logs, _ := exec.Command("docker", "logs", name).CombinedOutput()
+			t.Logf("traefik logs:\n%s", logs)
+		}
+		_ = exec.Command("docker", "rm", "-f", name).Run()
+	})
+	portOut, err := exec.Command("docker", "port", name, "80/tcp").Output()
+	if err != nil {
+		t.Fatalf("docker port: %v", err)
+	}
+	sc := bufio.NewScanner(strings.NewReader(string(portOut)))
+	sc.Scan()
+	addr := sc.Text()
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		addr = "http://127.0.0.1:" + addr[i+1:]
+	}
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(addr + "/free")
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == 200 {
+				return addr
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Fatal("traefik never served /free (plugin failed to load?)")
+	return ""
+}
+
+func must(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func sign(asset, amount, name, version, nonce string) string {
+	b, _ := json.Marshal(map[string]any{
+		"x402Version": 2,
+		"accepted": map[string]any{
+			"scheme": "exact", "network": "eip155:84532", "amount": amount, "asset": asset, "payTo": payTo,
+			"maxTimeoutSeconds": 60, "extra": map[string]string{"name": name, "version": version},
+		},
+		"payload": map[string]any{"signature": "0xsig", "authorization": map[string]string{"from": payer, "to": payTo, "value": amount, "nonce": nonce}},
+	})
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+func get(t *testing.T, url string, hdr map[string]string) (*http.Response, string) {
+	t.Helper()
+	req, _ := http.NewRequest("GET", url, nil)
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp, string(b)
+}
+
+func decodeHdr(t *testing.T, v string, into any) {
+	t.Helper()
+	b, err := base64.StdEncoding.DecodeString(v)
+	if err != nil {
+		t.Fatalf("header %q: %v", v, err)
+	}
+	if err := json.Unmarshal(b, into); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestE2E(t *testing.T) {
+	if out, err := exec.Command("docker", "info").CombinedOutput(); err != nil {
+		t.Skipf("docker unavailable: %v %s", err, out)
+	}
+	fac := &mockFacilitator{}
+	_, facPort := listenAll(t, fac)
+	_, upPort := listenAll(t, upstream())
+	base := startTraefik(t, facPort, upPort)
+
+	t.Run("unprotected passes through", func(t *testing.T) {
+		resp, body := get(t, base+"/free/page", nil)
+		if resp.StatusCode != 200 || !strings.Contains(body, "content for /free/page") {
+			t.Fatalf("%d %q", resp.StatusCode, body)
+		}
+	})
+
+	t.Run("unpaid requests get 402 on exact, prefix and suffix", func(t *testing.T) {
+		for _, p := range []string{"/report", "/premium/a/b", "/docs/manual.pdf"} {
+			resp, body := get(t, base+p, nil)
+			if resp.StatusCode != 402 {
+				t.Fatalf("%s: %d", p, resp.StatusCode)
+			}
+			var pr struct {
+				X402Version int `json:"x402Version"`
+				Error       string
+				Resource    struct{ URL, Description, MimeType string }
+				Accepts     []struct{ Asset, Amount, Network, PayTo string }
+			}
+			decodeHdr(t, resp.Header.Get("PAYMENT-REQUIRED"), &pr)
+			if pr.X402Version != 2 || len(pr.Accepts) != 2 || pr.Accepts[0].Asset != usdc || pr.Accepts[1].Asset != dai {
+				t.Fatalf("%s: %+v", p, pr)
+			}
+			if !strings.HasSuffix(pr.Resource.URL, p) || pr.Resource.Description != "Premium content" {
+				t.Fatalf("resource %+v", pr.Resource)
+			}
+			if !strings.Contains(body, `"x402Version":2`) {
+				t.Fatalf("body %q", body)
+			}
+		}
+	})
+
+	t.Run("traversal does not bypass", func(t *testing.T) {
+		resp, _ := get(t, base+"/premium/../premium/x", nil)
+		if resp.StatusCode != 402 {
+			t.Fatalf("%d", resp.StatusCode)
+		}
+	})
+
+	t.Run("paid with each asset", func(t *testing.T) {
+		for i, a := range []struct{ asset, amount, name, version string }{
+			{usdc, "10000", "USDC", "2"},
+			{dai, "10000000000000000", "Dai Stablecoin", "1"},
+		} {
+			resp, body := get(t, base+"/premium/data", map[string]string{"PAYMENT-SIGNATURE": sign(a.asset, a.amount, a.name, a.version, fmt.Sprintf("0x%02d", i))})
+			if resp.StatusCode != 200 {
+				t.Fatalf("%s: %d %s", a.name, resp.StatusCode, body)
+			}
+			var sr struct {
+				Success     bool
+				Transaction string
+				Payer       string
+			}
+			decodeHdr(t, resp.Header.Get("PAYMENT-RESPONSE"), &sr)
+			if !sr.Success || sr.Transaction != "0xdeadbeef" || sr.Payer != payer {
+				t.Fatalf("%+v", sr)
+			}
+			if !strings.Contains(body, "payer="+payer) || !strings.Contains(body, `sig=""`) {
+				t.Fatalf("upstream saw %q", body)
+			}
+		}
+	})
+
+	t.Run("replayed payment is rejected", func(t *testing.T) {
+		h := map[string]string{"PAYMENT-SIGNATURE": sign(usdc, "10000", "USDC", "2", "0xreplay")}
+		if resp, _ := get(t, base+"/premium/r", h); resp.StatusCode != 200 {
+			t.Fatalf("first %d", resp.StatusCode)
+		}
+		if resp, _ := get(t, base+"/premium/r", h); resp.StatusCode != 402 {
+			t.Fatalf("replay %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("upstream error is not charged", func(t *testing.T) {
+		_, before := fac.counts()
+		resp, body := get(t, base+"/premium/broken", map[string]string{"PAYMENT-SIGNATURE": sign(usdc, "10000", "USDC", "2", "0xbroken")})
+		if resp.StatusCode != 500 || !strings.Contains(body, "upstream exploded") {
+			t.Fatalf("%d %q", resp.StatusCode, body)
+		}
+		if _, after := fac.counts(); after != before {
+			t.Fatalf("settled on upstream error (%d -> %d)", before, after)
+		}
+	})
+
+	t.Run("failed settlement returns 402", func(t *testing.T) {
+		fac.mu.Lock()
+		fac.failFor = "0xnofunds"
+		fac.mu.Unlock()
+		resp, body := get(t, base+"/premium/data", map[string]string{"PAYMENT-SIGNATURE": sign(usdc, "10000", "USDC", "2", "0xnofunds")})
+		if resp.StatusCode != 402 || strings.Contains(body, "content for") {
+			t.Fatalf("%d %q", resp.StatusCode, body)
+		}
+		var sr struct {
+			Success     bool
+			ErrorReason string
+		}
+		decodeHdr(t, resp.Header.Get("PAYMENT-RESPONSE"), &sr)
+		if sr.Success || sr.ErrorReason != "insufficient_funds" {
+			t.Fatalf("%+v", sr)
+		}
+	})
+
+	t.Run("malformed payment is 400", func(t *testing.T) {
+		resp, _ := get(t, base+"/premium/x", map[string]string{"PAYMENT-SIGNATURE": "garbage!!"})
+		if resp.StatusCode != 400 {
+			t.Fatalf("%d", resp.StatusCode)
+		}
+	})
+
+	t.Run("paid streaming response is not buffered", func(t *testing.T) {
+		req, _ := http.NewRequest("GET", base+"/premium/stream", nil)
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("PAYMENT-SIGNATURE", sign(usdc, "10000", "USDC", "2", "0xstream"))
+		start := time.Now()
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		r := bufio.NewReader(resp.Body)
+		line, err := r.ReadString('\n')
+		if err != nil || !strings.HasPrefix(line, "data: 0") {
+			t.Fatalf("first event %q: %v", line, err)
+		}
+		if time.Since(start) > 700*time.Millisecond {
+			t.Fatalf("first event arrived after %v: response was buffered", time.Since(start))
+		}
+		if resp.Header.Get("PAYMENT-RESPONSE") == "" {
+			t.Fatal("settlement header missing")
+		}
+	})
+
+	t.Run("facilitator saw expected traffic", func(t *testing.T) {
+		v, s := fac.counts()
+		if v < 5 || s < 4 {
+			t.Fatalf("verify=%d settle=%d", v, s)
+		}
+	})
+}

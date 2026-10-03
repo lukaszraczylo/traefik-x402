@@ -1,0 +1,23 @@
+displayName: x402 Payments
+type: middleware
+import: github.com/lukaszraczylo/traefik-x402
+# Traefik binds the interpreted package under path.Base(import) with "-" -> "_"
+# ("traefik_x402"); the package declares `package traefikx402`, so override it.
+basePkg: traefikx402
+summary: Enforces x402 v2 payments (any ERC-20 or SPL asset) on exact URLs, prefixes and suffixes via a facilitator.
+testData:
+  facilitatorURL: https://x402.org/facilitator
+  accepts:
+    - network: eip155:84532
+      amount: "10000"
+      asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+      payTo: "0x209693Bc6afc0C5328bA36FaF03C514EF312287C"
+      extra:
+        name: USDC
+        version: "2"
+  exact:
+    - /premium-report
+  prefixes:
+    - /premium/
+  suffixes:
+    - .pdf
