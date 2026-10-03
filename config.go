@@ -49,6 +49,7 @@ type Config struct {
 	// Exact, Prefixes, Suffixes, Methods, Description and MimeType form an
 	// implicit rule appended after Rules, using the default Accepts.
 	FacilitatorHeaders       map[string]string `json:"facilitatorHeaders,omitempty"`
+	FacilitatorAuth          FacilitatorAuth   `json:"facilitatorAuth"`
 	PayerHeader              string            `json:"payerHeader,omitempty"`
 	FacilitatorTimeout       string            `json:"facilitatorTimeout,omitempty"`
 	MimeType                 string            `json:"mimeType,omitempty"`
@@ -57,12 +58,13 @@ type Config struct {
 	ResourceBaseURL          string            `json:"resourceBaseURL,omitempty"`
 	ExtensionsJSON           string            `json:"extensionsJSON,omitempty"`
 	FacilitatorURL           string            `json:"facilitatorURL,omitempty"`
-	Suffixes                 []string          `json:"suffixes,omitempty"`
+	SupportedCheck           string            `json:"supportedCheck,omitempty"`
 	Accepts                  []Accept          `json:"accepts,omitempty"`
-	Exact                    []string          `json:"exact,omitempty"`
 	Prefixes                 []string          `json:"prefixes,omitempty"`
 	Methods                  []string          `json:"methods,omitempty"`
 	Rules                    []Rule            `json:"rules,omitempty"`
+	Exact                    []string          `json:"exact,omitempty"`
+	Suffixes                 []string          `json:"suffixes,omitempty"`
 	ForwardPaymentHeader     bool              `json:"forwardPaymentHeader,omitempty"`
 	IgnoreCase               bool              `json:"ignoreCase,omitempty"`
 	ReplayGuard              bool              `json:"replayGuard"`
@@ -74,6 +76,7 @@ func CreateConfig() *Config {
 	return &Config{
 		FacilitatorTimeout: defaultFacTimeout,
 		Settlement:         settleAfter,
+		SupportedCheck:     supportCheckWarn,
 		ReplayGuard:        true,
 	}
 }
@@ -164,6 +167,12 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if err := validSettlement(c.Settlement); err != nil {
+		return err
+	}
+	if err := validSupportCheck(c.SupportedCheck); err != nil {
+		return err
+	}
+	if err := c.FacilitatorAuth.validate(); err != nil {
 		return err
 	}
 	if c.ResourceBaseURL != "" {

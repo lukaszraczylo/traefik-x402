@@ -1,0 +1,49 @@
+version: 2
+
+# Traefik plugins are source-only: Traefik loads them through Yaegi at runtime.
+builds:
+  - skip: true
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_v{{ .Version }}_source"
+    files:
+      - "*.go"
+      - go.mod
+      - .traefik.yml
+      - LICENSE*
+      - README*
+      - "!*_test.go"
+
+checksum:
+  name_template: "{{ .ProjectName }}_v{{ .Version }}_checksums.txt"
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^Merge"
+      - "^WIP"
+      - "^chore:"
+
+release:
+  github:
+    owner: lukaszraczylo
+    name: traefik-x402
+  name_template: "v{{ .Version }}"
+  draft: false
+  prerelease: auto
+
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args:
+      - sign-blob
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+    output: true

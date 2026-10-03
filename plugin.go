@@ -22,6 +22,7 @@ type Plugin struct {
 	fac            *facilitator
 	guard          *replayGuard
 	log            *slog.Logger
+	supportedDone  chan struct{}
 	baseURL        string
 	payerHeader    string
 	extensions     []byte
@@ -33,14 +34,14 @@ type Plugin struct {
 
 // New builds the middleware.
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	p, err := newPlugin(next, config, name)
+	p, err := newPlugin(ctx, next, config, name)
 	if err != nil {
 		return nil, err
 	}
 	return p, nil
 }
 
-func newPlugin(next http.Handler, c *Config, name string) (*Plugin, error) {
+func newPlugin(ctx context.Context, next http.Handler, c *Config, name string) (*Plugin, error) {
 	if err := c.Validate(); err != nil {
 		return nil, fmt.Errorf("x402: %w", err)
 	}
@@ -48,16 +49,25 @@ func newPlugin(next http.Handler, c *Config, name string) (*Plugin, error) {
 	if err != nil {
 		return nil, err
 	}
+	headers, err := resolveHeaders(c.FacilitatorHeaders)
+	if err != nil {
+		return nil, fmt.Errorf("x402: %w", err)
+	}
+	signer, err := newSigner(&c.FacilitatorAuth, time.Now)
+	if err != nil {
+		return nil, fmt.Errorf("x402: %w", err)
+	}
 	p := &Plugin{
 		next:           next,
 		log:            slog.New(slog.NewTextHandler(os.Stderr, nil)).With("plugin", "x402", "name", name),
-		fac:            newFacilitator(c.FacilitatorURL, timeout, c.FacilitatorHeaders),
+		fac:            newFacilitator(c.FacilitatorURL, timeout, headers),
 		baseURL:        strings.TrimRight(c.ResourceBaseURL, "/"),
 		payerHeader:    c.PayerHeader,
 		ignoreCase:     c.IgnoreCase,
 		settleBefore:   c.Settlement == settleBefore,
 		forwardPayment: c.ForwardPaymentHeader,
 	}
+	p.fac.signer = signer
 	if c.ExtensionsJSON != "" {
 		var ext bytes.Buffer
 		if err := json.Compact(&ext, []byte(c.ExtensionsJSON)); err != nil {
@@ -68,10 +78,39 @@ func newPlugin(next http.Handler, c *Config, name string) (*Plugin, error) {
 	if c.ReplayGuard {
 		p.guard = newReplayGuard(time.Now)
 	}
-	for _, r := range c.allRules() {
-		p.rules = append(p.rules, compileRule(&r, c.Accepts, c.IgnoreCase))
+
+	rules, defaults := c.allRules(), c.Accepts
+	switch c.SupportedCheck {
+	case supportCheckStrict:
+		rules, defaults, err = p.applySupported(ctx, timeout, rules, defaults)
+		if err != nil {
+			return nil, fmt.Errorf("x402: %w", err)
+		}
+	case supportCheckOff:
+	default:
+		p.supportedDone = make(chan struct{})
+		go p.warnUnsupported(timeout, rules, defaults) // #nosec G118 -- the check must outlive the context New receives
+	}
+	for i := range rules {
+		p.rules = append(p.rules, compileRule(&rules[i], defaults, c.IgnoreCase))
 	}
 	return p, nil
+}
+
+// resolveHeaders expands env: and file: secret references in header values.
+func resolveHeaders(in map[string]string) (map[string]string, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		r, err := resolveSecret(v)
+		if err != nil {
+			return nil, fmt.Errorf("facilitatorHeaders %q: %w", k, err)
+		}
+		out[k] = r
+	}
+	return out, nil
 }
 
 // marshalAccept encodes a requirement in the field order the x402 spec shows.
@@ -125,6 +164,10 @@ func (p *Plugin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cr := p.findRule(r)
 	if cr == nil {
 		p.next.ServeHTTP(w, r)
+		return
+	}
+	if r.Header.Get("Upgrade") != "" {
+		p.notImplemented(w, reasonUpgrade)
 		return
 	}
 	sig := r.Header.Get(headerSignature)
@@ -201,12 +244,11 @@ func (p *Plugin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	sw.finish()
 }
 
-// settlesBefore decides whether to settle before forwarding. Streaming and
-// upgrade requests always do: Yaegi hides Flusher and Hijacker behind its
-// ResponseWriter wrapper, so the post-upstream settlement writer would
-// buffer events and break WebSocket upgrades.
+// settlesBefore decides whether to settle before forwarding. Event streams
+// always do: Yaegi hides Flusher behind its ResponseWriter wrapper, so the
+// post-upstream settlement writer would hold events back.
 func (p *Plugin) settlesBefore(cr *rule, r *http.Request) bool {
-	if isStreamingRequest(r) {
+	if isEventStream(r) {
 		return true
 	}
 	if cr.settlement != "" {
@@ -215,8 +257,8 @@ func (p *Plugin) settlesBefore(cr *rule, r *http.Request) bool {
 	return p.settleBefore
 }
 
-func isStreamingRequest(r *http.Request) bool {
-	return r.Header.Get("Upgrade") != "" || strings.Contains(r.Header.Get("Accept"), "text/event-stream")
+func isEventStream(r *http.Request) bool {
+	return strings.Contains(r.Header.Get("Accept"), "text/event-stream")
 }
 
 func (p *Plugin) release(key string) {

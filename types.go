@@ -30,6 +30,7 @@ const (
 	reasonUnexpectedVerify    = "unexpected_verify_error"
 	reasonUnexpectedSettle    = "unexpected_settle_error"
 	reasonReplay              = "payment_already_used"
+	reasonUpgrade             = "upgrade_not_supported"
 )
 
 var errBadBase64 = errors.New("payment header is not valid base64")

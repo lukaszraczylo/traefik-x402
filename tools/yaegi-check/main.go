@@ -4,10 +4,18 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -27,9 +35,18 @@ const (
 	importPath     = "github.com/lukaszraczylo/traefik-x402"
 	pkgName        = "traefikx402"
 	usdc           = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
-	dai            = "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"
+	eurc           = "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42"
 	payTo          = "0x209693Bc6afc0C5328bA36FaF03C514EF312287C"
 )
+
+const (
+	keyAmount   = "amount"
+	keyAccepts  = "accepts"
+	pathPremium = "/premium/"
+	headerUp    = "Upgrade"
+)
+
+const solana = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
 
 var failures int
 
@@ -91,9 +108,11 @@ func run() int {
 	_, err = build(map[string]interface{}{keyFacilitator: "https://f.example"})
 	check(err != nil, "invalid config returns a real error across the reflect boundary (%v)", err)
 
-	fac := newFacilitator()
+	auth := &authState{}
+	fac := newFacilitator(auth)
 	defer fac.Close()
 	flowChecks(build, fac)
+	authChecks(build, fac, auth)
 
 	if failures > 0 {
 		fmt.Printf("\n%d check(s) failed\n", failures)
@@ -105,12 +124,12 @@ func run() int {
 
 func flowChecks(build func(map[string]interface{}) (http.Handler, error), fac *httptest.Server) {
 	accepts := []interface{}{
-		map[string]interface{}{"network": "eip155:84532", "amount": "10000", "asset": usdc, "payTo": payTo, "extra": map[string]interface{}{"name": "USDC", "version": "2"}},
-		map[string]interface{}{"network": "eip155:84532", "amount": "10000000000000000", "asset": dai, "payTo": payTo, "extra": map[string]interface{}{"name": "Dai Stablecoin", "version": "1"}},
+		map[string]interface{}{"network": "eip155:84532", keyAmount: "10000", "asset": usdc, "payTo": payTo, "extra": map[string]interface{}{"name": "USDC", "version": "2"}},
+		map[string]interface{}{"network": "eip155:84532", keyAmount: "10000", "asset": eurc, "payTo": payTo, "extra": map[string]interface{}{"name": "EURC", "version": "2"}},
 	}
 	h, err := build(map[string]interface{}{
-		keyFacilitator: fac.URL, "allowInsecureFacilitator": true, "accepts": accepts,
-		"prefixes": []interface{}{"/premium/"}, "suffixes": []interface{}{".pdf"}, "exact": []interface{}{"/exact"},
+		keyFacilitator: fac.URL, "allowInsecureFacilitator": true, keyAccepts: accepts,
+		"prefixes": []interface{}{pathPremium}, "suffixes": []interface{}{".pdf"}, "exact": []interface{}{"/exact"},
 		"payerHeader": "X-Payer", "description": "Premium", "mimeType": "application/json",
 	})
 	must(err)
@@ -129,7 +148,7 @@ func flowChecks(build func(map[string]interface{}) (http.Handler, error), fac *h
 	check(serve(h, "/free", nil).Code == 200, "unprotected path passes through")
 	check(serve(h, "/free/../premium/x", nil).Code == 402, "dot-dot traversal still protected")
 
-	for _, asset := range []string{usdc, dai} {
+	for _, asset := range []string{usdc, eurc} {
 		rec = serve(h, "/premium/data", map[string]string{headerSig: signature(accepts, asset)})
 		var sr struct {
 			Success     bool
@@ -154,10 +173,15 @@ func flowChecks(build func(map[string]interface{}) (http.Handler, error), fac *h
 	check(rec.Code == 402 && !strings.Contains(rec.Body.String(), "payer="), "failed settlement replaces response with 402 (got %d)", rec.Code)
 
 	hb, err := build(map[string]interface{}{
-		keyFacilitator: fac.URL, "allowInsecureFacilitator": true, "accepts": accepts,
-		"prefixes": []interface{}{"/premium/"}, "settlement": "before",
+		keyFacilitator: fac.URL, "allowInsecureFacilitator": true, keyAccepts: accepts,
+		"prefixes": []interface{}{pathPremium}, "settlement": "before",
 	})
 	must(err)
+	rec = serve(h, "/premium/ws", map[string]string{headerUp: "websocket", "Connection": headerUp})
+	check(rec.Code == 501, "websocket upgrade on a protected path -> 501 (got %d)", rec.Code)
+	rec = serve(h, "/free/ws", map[string]string{headerUp: "websocket", "Connection": headerUp})
+	check(rec.Code == 200, "websocket upgrade on an unprotected path passes through (got %d)", rec.Code)
+
 	rec = serve(hb, "/premium/data", map[string]string{headerSig: signatureNonce(accepts, usdc, "before")})
 	check(rec.Code == 200 && rec.Header().Get("PAYMENT-RESPONSE") != "", "settlement=before -> 200 + header (got %d)", rec.Code)
 }
@@ -173,11 +197,52 @@ func upstreamHandler(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "ok payer=%s sig=%q", r.Header.Get("X-Payer"), r.Header.Get(headerSig)) // #nosec G705 -- test upstream echoing into a recorder, not a browser
 }
 
+// authState records how the fake facilitator judged Authorization headers.
+type authState struct {
+	edPub   ed25519.PublicKey
+	ecPub   *ecdsa.PublicKey
+	good    int
+	bad     int
+	missing int
+}
+
+func (a *authState) check(h string) {
+	tok := strings.TrimPrefix(h, "Bearer ")
+	parts := strings.Split(tok, ".")
+	if h == "" || len(parts) != 3 {
+		a.missing++
+		return
+	}
+	var hdr struct{ Alg string }
+	hb, _ := base64.RawURLEncoding.DecodeString(parts[0])
+	_ = json.Unmarshal(hb, &hdr)
+	sig, _ := base64.RawURLEncoding.DecodeString(parts[2])
+	msg := []byte(parts[0] + "." + parts[1])
+	ok := false
+	switch hdr.Alg {
+	case "EdDSA":
+		ok = ed25519.Verify(a.edPub, msg, sig)
+	case "ES256":
+		d := sha256.Sum256(msg)
+		ok = len(sig) == 64 && ecdsa.Verify(a.ecPub, d[:], new(big.Int).SetBytes(sig[:32]), new(big.Int).SetBytes(sig[32:]))
+	}
+	if ok {
+		a.good++
+	} else {
+		a.bad++
+	}
+}
+
 // newFacilitator approves everything except nonces containing "settlefail".
-func newFacilitator() *httptest.Server {
+func newFacilitator(auth *authState) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
+		if r.Header.Get("Authorization") != "" {
+			auth.check(r.Header.Get("Authorization"))
+		}
 		switch r.URL.Path {
+		case "/supported":
+			_, _ = io.WriteString(w, `{"kinds":[{"x402Version":2,"scheme":"exact","network":"eip155:84532"},{"x402Version":2,"scheme":"exact","network":"`+solana+`","extra":{"feePayer":"FEEPAYER"}}]}`)
 		case "/verify":
 			_, _ = io.WriteString(w, `{"isValid":true,"payer":"0x857b06519E91e3A54538791bDbb0E22373e36b66"}`)
 		case "/settle":
@@ -265,4 +330,45 @@ func must(err error) {
 		fmt.Println("fatal:", err)
 		os.Exit(1)
 	}
+}
+
+// authChecks drives the signing and /supported paths, which use crypto,
+// encoding/pem and encoding/asn1 inside the interpreter.
+func authChecks(build func(map[string]interface{}) (http.Handler, error), fac *httptest.Server, auth *authState) {
+	edPub, edPriv, err := ed25519.GenerateKey(rand.Reader)
+	must(err)
+	ecKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	must(err)
+	der, err := x509.MarshalECPrivateKey(ecKey)
+	must(err)
+	auth.edPub, auth.ecPub = edPub, &ecKey.PublicKey
+	ecPEM := string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}))
+
+	solanaAccept := map[string]interface{}{"network": solana, keyAmount: "10000", "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "payTo": "payee"}
+	for name, secret := range map[string]string{
+		"Ed25519": base64.StdEncoding.EncodeToString(edPriv),
+		"ES256":   ecPEM,
+	} {
+		before := auth.good
+		h, err := build(map[string]interface{}{
+			keyFacilitator: fac.URL, "allowInsecureFacilitator": true, "supportedCheck": "strict",
+			"facilitatorAuth": map[string]interface{}{"type": "cdp", "keyID": "kid", "keySecret": secret},
+			keyAccepts:        []interface{}{solanaAccept}, "prefixes": []interface{}{pathPremium},
+		})
+		must(err)
+		check(auth.good > before && auth.bad == 0, "strict /supported call carries a valid %s JWT (good=%d bad=%d)", name, auth.good, auth.bad)
+		rec := serve(h, "/premium/data", nil)
+		var pr struct {
+			Accepts []struct{ Extra map[string]string }
+		}
+		decode(rec.Header().Get("PAYMENT-REQUIRED"), &pr)
+		check(len(pr.Accepts) == 1 && pr.Accepts[0].Extra["feePayer"] == "FEEPAYER", "%s: feePayer from /supported appears in the 402 (%v)", name, pr.Accepts)
+	}
+
+	_, err = build(map[string]interface{}{
+		keyFacilitator: fac.URL, "allowInsecureFacilitator": true, "supportedCheck": "strict",
+		keyAccepts: []interface{}{map[string]interface{}{"network": "eip155:1", keyAmount: "1", "asset": usdc, "payTo": payTo}},
+		"prefixes": []interface{}{pathPremium},
+	})
+	check(err != nil && strings.Contains(err.Error(), "eip155:1"), "strict mode rejects an unsupported network (%v)", err)
 }

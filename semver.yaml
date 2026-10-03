@@ -1,0 +1,11 @@
+version: 1
+force:
+  existing: true
+matching: regex
+wording:
+  patch:
+    - '(?m)^(fix|perf|chore|docs|style|test|ci|refactor)(\([^)]*\))?:'
+  minor:
+    - '(?m)^feat(\([^)]*\))?:'
+  major:
+    - '(?m)^Semver-Major:'

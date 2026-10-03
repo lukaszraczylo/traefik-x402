@@ -1,0 +1,37 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    reviewers:
+      - "lukaszraczylo"
+
+  # The plugin has no module dependencies. The yaegi harness has some.
+  - package-ecosystem: "gomod"
+    directory: "/tools/yaegi-check"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "go"
+    reviewers:
+      - "lukaszraczylo"
+    # Keep yaegi on the version Traefik vendors.
+    ignore:
+      - dependency-name: "github.com/traefik/yaegi"

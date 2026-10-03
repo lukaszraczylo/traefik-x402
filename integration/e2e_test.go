@@ -6,6 +6,8 @@ package integration
 
 import (
 	"bufio"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -25,33 +27,56 @@ import (
 const (
 	traefikImage = "traefik:v3.7"
 	usdc         = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
-	dai          = "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"
+	eurc         = "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42"
 	payTo        = "0x209693Bc6afc0C5328bA36FaF03C514EF312287C"
 	payer        = "0x857b06519E91e3A54538791bDbb0E22373e36b66"
 )
 
 type mockFacilitator struct {
-	mu      sync.Mutex
-	verify  int
-	settle  int
-	failFor string
+	pub      ed25519.PublicKey
+	failFor  string
+	verify   int
+	settle   int
+	supports int
+	authGood int
+	authBad  int
+	mu       sync.Mutex
+}
+
+// checkAuth verifies the EdDSA bearer JWT the plugin signs for each call.
+func (m *mockFacilitator) checkAuth(h string) {
+	parts := strings.Split(strings.TrimPrefix(h, "Bearer "), ".")
+	if len(parts) != 3 {
+		m.authBad++
+		return
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err == nil && ed25519.Verify(m.pub, []byte(parts[0]+"."+parts[1]), sig) {
+		m.authGood++
+		return
+	}
+	m.authBad++
 }
 
 func (m *mockFacilitator) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	b, _ := io.ReadAll(r.Body)
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.checkAuth(r.Header.Get("Authorization"))
 	switch r.URL.Path {
+	case "/supported":
+		m.supports++
+		_, _ = io.WriteString(w, `{"kinds":[{"x402Version":2,"scheme":"exact","network":"eip155:84532"}]}`)
 	case "/verify":
 		m.verify++
-		fmt.Fprintf(w, `{"isValid":true,"payer":%q}`, payer)
+		_, _ = fmt.Fprintf(w, `{"isValid":true,"payer":%q}`, payer)
 	case "/settle":
 		m.settle++
 		if m.failFor != "" && strings.Contains(string(b), m.failFor) {
-			io.WriteString(w, `{"success":false,"errorReason":"insufficient_funds","transaction":"","network":"eip155:84532"}`)
+			_, _ = io.WriteString(w, `{"success":false,"errorReason":"insufficient_funds","transaction":"","network":"eip155:84532"}`)
 			return
 		}
-		fmt.Fprintf(w, `{"success":true,"transaction":"0xdeadbeef","network":"eip155:84532","payer":%q}`, payer)
+		_, _ = fmt.Fprintf(w, `{"success":true,"transaction":"0xdeadbeef","network":"eip155:84532","payer":%q}`, payer)
 	default:
 		http.NotFound(w, r)
 	}
@@ -65,7 +90,8 @@ func (m *mockFacilitator) counts() (int, int) {
 
 func listenAll(t *testing.T, h http.Handler) (*httptest.Server, int) {
 	t.Helper()
-	l, err := net.Listen("tcp", "0.0.0.0:0")
+	// The Traefik container reaches the mocks through the host gateway.
+	l, err := net.Listen("tcp", "0.0.0.0:0") // #nosec G102 -- test mocks must be reachable from the container
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,6 +105,15 @@ func listenAll(t *testing.T, h http.Handler) (*httptest.Server, int) {
 func upstream() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case strings.HasSuffix(r.URL.Path, "/ws"):
+			conn, buf, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				http.Error(w, err.Error(), 500)
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			_, _ = buf.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+			_ = buf.Flush()
 		case strings.HasSuffix(r.URL.Path, "/broken"):
 			http.Error(w, "upstream exploded", http.StatusInternalServerError)
 		case strings.HasSuffix(r.URL.Path, "/stream"):
@@ -90,7 +125,7 @@ func upstream() http.Handler {
 				time.Sleep(300 * time.Millisecond)
 			}
 		default:
-			fmt.Fprintf(w, "content for %s payer=%s sig=%q", r.URL.Path, r.Header.Get("X-Payer"), r.Header.Get("PAYMENT-SIGNATURE"))
+			_, _ = fmt.Fprintf(w, "content for %s payer=%s sig=%q", r.URL.Path, r.Header.Get("X-Payer"), r.Header.Get("PAYMENT-SIGNATURE")) // #nosec G705 -- mock upstream response read by the test client, not a browser
 		}
 	})
 }
@@ -122,6 +157,11 @@ func dynamicConfig(facPort, upPort int) string {
           facilitatorURL: http://host.docker.internal:%d
           allowInsecureFacilitator: true
           payerHeader: X-Payer
+          supportedCheck: strict
+          facilitatorAuth:
+            type: cdp
+            keyID: e2e-key
+            keySecret: env:X402_E2E_KEY_SECRET
           settlement: %s
           description: Premium content
           mimeType: text/plain
@@ -134,19 +174,19 @@ func dynamicConfig(facPort, upPort int) string {
                 name: USDC
                 version: "2"
             - network: eip155:84532
-              amount: "10000000000000000"
+              amount: "10000"
               asset: "%s"
               payTo: "%s"
               extra:
-                name: Dai Stablecoin
-                version: "1"
+                name: EURC
+                version: "2"
           exact:
             - /report
           prefixes:
             - /premium/
           suffixes:
             - .pdf
-`, upPort, facPort, settlementMode(), usdc, payTo, dai, payTo)
+`, upPort, facPort, settlementMode(), usdc, payTo, eurc, payTo)
 }
 
 const staticConfig = `entryPoints:
@@ -163,18 +203,19 @@ log:
   level: DEBUG
 `
 
-func startTraefik(t *testing.T, facPort, upPort int) string {
+func startTraefik(t *testing.T, facPort, upPort int, keySecret string) string {
 	t.Helper()
 	repo, err := filepath.Abs("..")
 	if err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
-	must(t, os.MkdirAll(filepath.Join(dir, "dynamic"), 0o755))
-	must(t, os.WriteFile(filepath.Join(dir, "traefik.yml"), []byte(staticConfig), 0o644))
-	must(t, os.WriteFile(filepath.Join(dir, "dynamic", "x402.yml"), []byte(dynamicConfig(facPort, upPort)), 0o644))
+	must(t, os.MkdirAll(filepath.Join(dir, "dynamic"), 0o750))
+	must(t, os.WriteFile(filepath.Join(dir, "traefik.yml"), []byte(staticConfig), 0o600))
+	must(t, os.WriteFile(filepath.Join(dir, "dynamic", "x402.yml"), []byte(dynamicConfig(facPort, upPort)), 0o600))
 	name := fmt.Sprintf("x402-e2e-%d", time.Now().UnixNano())
-	out, err := exec.Command("docker", "run", "-d", "--rm", "--name", name,
+	out, err := exec.Command("docker", "run", "-d", "--rm", "--name", name, // #nosec G204 -- fixed docker binary; arguments are test-controlled
+		"-e", "X402_E2E_KEY_SECRET="+keySecret,
 		"--add-host", "host.docker.internal:host-gateway", "-p", "127.0.0.1::80",
 		"-v", repo+":/plugins-local/src/github.com/lukaszraczylo/traefik-x402:ro",
 		"-v", filepath.Join(dir, "traefik.yml")+":/etc/traefik/traefik.yml:ro",
@@ -185,12 +226,12 @@ func startTraefik(t *testing.T, facPort, upPort int) string {
 	}
 	t.Cleanup(func() {
 		if t.Failed() {
-			logs, _ := exec.Command("docker", "logs", name).CombinedOutput()
+			logs, _ := exec.Command("docker", "logs", name).CombinedOutput() // #nosec G204 -- fixed docker binary; arguments are test-controlled
 			t.Logf("traefik logs:\n%s", logs)
 		}
-		_ = exec.Command("docker", "rm", "-f", name).Run()
+		_ = exec.Command("docker", "rm", "-f", name).Run() // #nosec G204 -- fixed docker binary; arguments are test-controlled
 	})
-	portOut, err := exec.Command("docker", "port", name, "80/tcp").Output()
+	portOut, err := exec.Command("docker", "port", name, "80/tcp").Output() // #nosec G204 -- fixed docker binary; arguments are test-controlled
 	if err != nil {
 		t.Fatalf("docker port: %v", err)
 	}
@@ -204,7 +245,7 @@ func startTraefik(t *testing.T, facPort, upPort int) string {
 	for time.Now().Before(deadline) {
 		resp, err := http.Get(addr + "/free")
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode == 200 {
 				return addr
 			}
@@ -234,7 +275,13 @@ func sign(asset, amount, name, version, nonce string) string {
 	return base64.StdEncoding.EncodeToString(b)
 }
 
-func get(t *testing.T, url string, hdr map[string]string) (*http.Response, string) {
+// result keeps the parts of a response the tests assert on, so no body stays open.
+type result struct {
+	Header     http.Header
+	StatusCode int
+}
+
+func get(t *testing.T, url string, hdr map[string]string) (result, string) {
 	t.Helper()
 	req, _ := http.NewRequest("GET", url, nil)
 	for k, v := range hdr {
@@ -246,7 +293,7 @@ func get(t *testing.T, url string, hdr map[string]string) (*http.Response, strin
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
-	return resp, string(b)
+	return result{StatusCode: resp.StatusCode, Header: resp.Header}, string(b)
 }
 
 func decodeHdr(t *testing.T, v string, into any) {
@@ -264,10 +311,12 @@ func TestE2E(t *testing.T) {
 	if out, err := exec.Command("docker", "info").CombinedOutput(); err != nil {
 		t.Skipf("docker unavailable: %v %s", err, out)
 	}
-	fac := &mockFacilitator{}
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	fac := &mockFacilitator{pub: pub}
 	_, facPort := listenAll(t, fac)
 	_, upPort := listenAll(t, upstream())
-	base := startTraefik(t, facPort, upPort)
+	base := startTraefik(t, facPort, upPort, base64.StdEncoding.EncodeToString(priv))
 
 	t.Run("unprotected passes through", func(t *testing.T) {
 		resp, body := get(t, base+"/free/page", nil)
@@ -289,7 +338,7 @@ func TestE2E(t *testing.T) {
 				Accepts     []struct{ Asset, Amount, Network, PayTo string }
 			}
 			decodeHdr(t, resp.Header.Get("PAYMENT-REQUIRED"), &pr)
-			if pr.X402Version != 2 || len(pr.Accepts) != 2 || pr.Accepts[0].Asset != usdc || pr.Accepts[1].Asset != dai {
+			if pr.X402Version != 2 || len(pr.Accepts) != 2 || pr.Accepts[0].Asset != usdc || pr.Accepts[1].Asset != eurc {
 				t.Fatalf("%s: %+v", p, pr)
 			}
 			if !strings.HasSuffix(pr.Resource.URL, p) || pr.Resource.Description != "Premium content" {
@@ -311,7 +360,7 @@ func TestE2E(t *testing.T) {
 	t.Run("paid with each asset", func(t *testing.T) {
 		for i, a := range []struct{ asset, amount, name, version string }{
 			{usdc, "10000", "USDC", "2"},
-			{dai, "10000000000000000", "Dai Stablecoin", "1"},
+			{eurc, "10000", "EURC", "2"},
 		} {
 			resp, body := get(t, base+"/premium/data", map[string]string{"PAYMENT-SIGNATURE": sign(a.asset, a.amount, a.name, a.version, fmt.Sprintf("0x%02d", i))})
 			if resp.StatusCode != 200 {
@@ -401,10 +450,48 @@ func TestE2E(t *testing.T) {
 		}
 	})
 
+	t.Run("websocket upgrade is rejected on protected paths only", func(t *testing.T) {
+		if got := upgradeStatus(t, base, "/premium/ws"); got != 501 {
+			t.Fatalf("protected: %d", got)
+		}
+		if got := upgradeStatus(t, base, "/free/ws"); got != 101 {
+			t.Fatalf("unprotected: %d", got)
+		}
+	})
+
 	t.Run("facilitator saw expected traffic", func(t *testing.T) {
 		v, s := fac.counts()
 		if v < 5 || s < 4 {
 			t.Fatalf("verify=%d settle=%d", v, s)
 		}
+		fac.mu.Lock()
+		defer fac.mu.Unlock()
+		if fac.supports != 1 {
+			t.Fatalf("/supported calls: %d", fac.supports)
+		}
+		if fac.authGood < 7 || fac.authBad != 0 {
+			t.Fatalf("signed calls good=%d bad=%d", fac.authGood, fac.authBad)
+		}
 	})
+}
+
+// upgradeStatus sends a WebSocket handshake over a raw connection and returns the status code.
+func upgradeStatus(t *testing.T, base, path string) int {
+	t.Helper()
+	conn, err := net.Dial("tcp", strings.TrimPrefix(base, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n", path)
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	var code int
+	if _, err := fmt.Sscanf(line, "HTTP/1.1 %d", &code); err != nil {
+		t.Fatalf("status line %q", line)
+	}
+	return code
 }

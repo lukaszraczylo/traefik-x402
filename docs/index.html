@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>traefik-x402: x402 payments for Traefik routes</title>
+<meta name="description" content="A Traefik plugin that answers 402 Payment Required on the URLs you choose, then verifies and settles x402 v2 payments through a facilitator before it serves the response.">
+<link rel="canonical" href="https://traefik-x402.raczylo.com/">
+<style>
+:root {
+  --bg: #fbfbfa;
+  --fg: #1a1a19;
+  --muted: #5d5d59;
+  --line: #d9d9d4;
+  --code-bg: #f1f1ee;
+  --accent: #0b5cad;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131312;
+    --fg: #ecece8;
+    --muted: #a1a19a;
+    --line: #34342f;
+    --code-bg: #1d1d1b;
+    --accent: #6cb2ff;
+  }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 18px/1.65 Charter, "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+}
+a { color: var(--accent); text-underline-offset: 2px; }
+code, pre { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.88em; }
+code { background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 3px; }
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 14px 16px;
+  overflow-x: auto;
+  line-height: 1.5;
+  margin: 1em 0;
+}
+pre code { background: none; padding: 0; font-size: 1em; }
+.wrap { max-width: 880px; margin: 0 auto; padding: 0 20px; }
+header.site { border-bottom: 1px solid var(--line); }
+header.site .wrap { display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: baseline; padding-top: 14px; padding-bottom: 14px; }
+header.site strong { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.95em; }
+header.site, table, .src, footer { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+header.site nav { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 0.92em; margin-left: auto; }
+header.site nav a { color: var(--muted); text-decoration: none; display: inline-block; padding: 4px 2px; min-height: 24px; }
+header.site nav a:hover { color: var(--fg); text-decoration: underline; }
+.hero { padding: 56px 0 36px; border-bottom: 1px solid var(--line); }
+h1 { font-size: clamp(1.9rem, 5vw, 2.7rem); line-height: 1.15; margin: 0 0 16px; letter-spacing: -0.02em; }
+.lede { font-size: 1.12rem; color: var(--muted); max-width: 40em; margin: 0 0 22px; }
+.actions a { display: inline-block; padding: 4px 0; margin-right: 22px; }
+section { padding: 40px 0; border-bottom: 1px solid var(--line); }
+section:last-of-type { border-bottom: none; }
+h2 { font-size: 1.45rem; margin: 0 0 12px; letter-spacing: -0.01em; }
+h3 { font-size: 1.05rem; margin: 26px 0 6px; }
+p { margin: 0 0 1em; max-width: 44em; }
+ul { padding-left: 1.2em; margin: 0 0 1em; max-width: 44em; }
+li { margin: 0.25em 0; }
+table { width: 100%; border-collapse: collapse; margin: 1em 0; font-size: 0.93em; display: block; overflow-x: auto; }
+th, td { text-align: left; padding: 8px 12px 8px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 600; color: var(--muted); white-space: nowrap; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; padding-right: 16px; white-space: nowrap; }
+.note { border: 1px solid var(--line); border-radius: 4px; padding: 4px 16px; margin: 1.2em 0; max-width: 44em; }
+.src { color: var(--muted); font-size: 0.88em; }
+footer { padding: 28px 0 48px; color: var(--muted); font-size: 0.92em; border-top: 1px solid var(--line); }
+</style>
+</head>
+<body>
+<header class="site">
+  <div class="wrap">
+    <strong>traefik-x402</strong>
+    <nav aria-label="Sections">
+      <a href="#install">Install</a>
+      <a href="#urls">URLs</a>
+      <a href="#assets">Assets</a>
+      <a href="#facilitator">Facilitator</a>
+      <a href="#settlement">Settlement</a>
+      <a href="#limits">Limits</a>
+      <a href="#measured">Measured</a>
+      <a href="https://github.com/lukaszraczylo/traefik-x402">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+<div class="hero">
+  <h1>Charge for Traefik routes with x402</h1>
+  <p class="lede">A Traefik middleware plugin. It answers <code>402 Payment Required</code> on the URLs you choose. When the client pays, the plugin verifies and settles the payment through an x402 v2 facilitator, then serves the response.</p>
+  <p class="actions"><a href="#install">Install</a><a href="https://github.com/lukaszraczylo/traefik-x402">Source and README</a></p>
+</div>
+
+<section id="install">
+  <h2>Install</h2>
+  <p>Enable the plugin in the Traefik static configuration, then attach the middleware to a router.</p>
+<pre><code>experimental:
+  plugins:
+    x402:
+      moduleName: github.com/lukaszraczylo/traefik-x402
+      version: v0.1.0   # use the latest release tag</code></pre>
+<pre><code>http:
+  middlewares:
+    pay:
+      plugin:
+        x402:
+          facilitatorURL: https://x402.org/facilitator
+          accepts:
+            - network: eip155:84532
+              amount: "10000"     # 0.01 USDC in atomic units
+              asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+              payTo: "0x209693Bc6afc0C5328bA36FaF03C514EF312287C"
+              extra: { name: USDC, version: "2" }
+          exact:    [/report]
+          prefixes: [/premium/]
+          suffixes: [.pdf]</code></pre>
+  <p>An unpaid request to <code>/premium/data</code> now returns <code>402</code> with a <code>PAYMENT-REQUIRED</code> header. The header holds base64 of this JSON, and the body holds the same JSON:</p>
+<pre><code>{"x402Version":2,"error":"PAYMENT-SIGNATURE header is required",
+ "resource":{"url":"https://api.example.com/premium/data"},
+ "accepts":[{"scheme":"exact","network":"eip155:84532","amount":"10000",
+   "asset":"0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+   "payTo":"0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
+   "maxTimeoutSeconds":60,"extra":{"name":"USDC","version":"2"}}]}</code></pre>
+  <p>The client signs a payment and retries with it in <code>PAYMENT-SIGNATURE</code>. The plugin never touches a wallet or a chain. The facilitator does that.</p>
+</section>
+
+<section id="urls">
+  <h2>Choose which URLs to protect</h2>
+  <p>A rule selects a request when the path matches any entry of any list.</p>
+  <table>
+    <thead><tr><th>Field</th><th>Matches when the path</th><th>Example</th></tr></thead>
+    <tbody>
+      <tr><td><code>exact</code></td><td>equals the entry</td><td><code>/report</code></td></tr>
+      <tr><td><code>prefixes</code></td><td>starts with the entry</td><td><code>/premium/</code> matches <code>/premium/a/b</code></td></tr>
+      <tr><td><code>suffixes</code></td><td>ends with the entry</td><td><code>.pdf</code> matches <code>/docs/manual.pdf</code></td></tr>
+    </tbody>
+  </table>
+  <ul>
+    <li>The plugin tests the decoded path and its cleaned form, so <code>/free/../premium/x</code> is still protected.</li>
+    <li>Use <code>rules</code> for different prices on different paths. The first matching rule wins.</li>
+    <li><code>methods</code> limits a rule to some HTTP methods. CORS preflight (<code>OPTIONS</code>) is never charged by default.</li>
+    <li><code>ignoreCase: true</code> turns off case sensitivity.</li>
+  </ul>
+</section>
+
+<section id="assets">
+  <h2>Offer several assets for one URL</h2>
+  <p>Each entry in <code>accepts</code> is one payment option. The client picks one. The plugin accepts the payment only when the client's echo equals one of your options exactly. Token values below were read from Base mainnet on 2026-10-03.</p>
+<pre><code>accepts:
+  - network: eip155:8453            # USDC on Base
+    amount: "10000"                 # 0.01 USDC, 6 decimals
+    asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    payTo: "0x209693Bc6afc0C5328bA36FaF03C514EF312287C"
+    extra: { name: USD Coin, version: "2" }
+  - network: eip155:8453            # EURC on Base
+    amount: "10000"                 # 0.01 EURC, 6 decimals
+    asset: "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42"
+    payTo: "0x209693Bc6afc0C5328bA36FaF03C514EF312287C"
+    extra: { name: EURC, version: "2" }
+  - network: solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp
+    amount: "10000"
+    asset: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+    payTo: "&lt;your Solana address&gt;"</code></pre>
+  <p><code>amount</code> is in the token's atomic units, so work it out from <code>decimals()</code>. For an EIP-3009 token, <code>extra</code> carries the EIP-712 domain <code>name</code> and <code>version</code> of the contract. A token without EIP-3009 needs the Permit2 method, which <code>extra.assetTransferMethod</code> selects in the x402 EVM specification. Whether a facilitator offers it is the facilitator's decision. The plugin passes <code>extra</code> through.</p>
+</section>
+
+<section id="facilitator">
+  <h2>Talk to the facilitator</h2>
+  <h3>Credentials without a proxy</h3>
+  <p>Values in <code>facilitatorHeaders</code> and in <code>facilitatorAuth</code> can be <code>env:NAME</code> or <code>file:/path</code> references, so secrets stay out of the Traefik configuration. For the Coinbase Developer Platform facilitator, the plugin signs the per-request JWT itself:</p>
+<pre><code>facilitatorURL: https://api.cdp.coinbase.com/platform/v2/x402
+facilitatorAuth:
+  type: cdp
+  keyID: env:CDP_API_KEY_ID
+  keySecret: file:/run/secrets/cdp_api_key_secret</code></pre>
+  <p>It signs with EdDSA for an Ed25519 key and ES256 for a P-256 PEM key. One token is cached for each request URI and reused until 30 seconds before it expires.</p>
+  <h3>Check what the facilitator supports</h3>
+  <table>
+    <thead><tr><th>supportedCheck</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><code>off</code></td><td>No check.</td></tr>
+      <tr><td><code>warn</code> (default)</td><td>Background check after start-up. Logs options the facilitator does not list.</td></tr>
+      <tr><td><code>strict</code></td><td>Checks before start-up. An unreachable facilitator or an unsupported option stops the plugin. Fills <code>extra.feePayer</code> from the facilitator for options that have none, which Solana needs.</td></tr>
+    </tbody>
+  </table>
+  <p class="src">Strict mode ran against <code>https://x402.org/facilitator</code> on 2026-10-03: it accepted Base Sepolia and Solana devnet, filled the Solana fee payer, and rejected Base mainnet, which that facilitator does not list.</p>
+</section>
+
+<section id="settlement">
+  <h2>Settle after the upstream answers</h2>
+  <table>
+    <thead><tr><th>settlement</th><th>Order</th><th>Upstream error</th></tr></thead>
+    <tbody>
+      <tr><td><code>after</code> (default)</td><td>verify, upstream, settle</td><td>Not charged</td></tr>
+      <tr><td><code>before</code></td><td>verify, settle, upstream</td><td>Charged</td></tr>
+    </tbody>
+  </table>
+  <p>In <code>after</code> mode the plugin settles when the upstream commits to a status below 400, before the first body byte reaches the client. Bodies stream without buffering. If the facilitator reports a failed settlement, the plugin replaces the response with <code>402</code> and a <code>PAYMENT-RESPONSE</code> header that describes the failure. If the settle call itself fails, the plugin answers <code>500</code> with <code>unexpected_settle_error</code>.</p>
+  <p>A replay guard rejects a second request that carries a payment already in use. It closes the gap between verification and settlement. The guard is in memory and belongs to one Traefik instance.</p>
+</section>
+
+<section id="limits">
+  <h2>Limits</h2>
+  <h3>WebSocket</h3>
+  <div class="note">
+    <p>Traefik runs plugins in Yaegi, which hides <code>Flusher</code> and <code>Hijacker</code> from a wrapped response writer. A request with an <code>Upgrade</code> header to a protected path gets <code>501</code> with <code>upgrade_not_supported</code>. Upgrade requests to unprotected paths pass through. Server-sent events work: a request with <code>Accept: text/event-stream</code> settles before the upstream runs.</p>
+  </div>
+  <ul>
+    <li>The plugin converts no prices. You write each <code>amount</code> in atomic units.</li>
+    <li>The plugin is not a facilitator and offers no discovery endpoint.</li>
+    <li>The replay guard does not span replicas. The chain and the facilitator guard across them.</li>
+    <li>No test has called the CDP service, because that needs a CDP account. Tests check the signatures with the matching public key.</li>
+  </ul>
+</section>
+
+<section id="measured">
+  <h2>Measured</h2>
+  <p>Benchmarks ran on an Apple M4 Max (darwin/arm64, Go 1.27.1) with compiled code. Traefik runs the plugin in Yaegi, which is slower. Command: <code>go test -run '^$' -bench . -benchmem -count=3 .</code></p>
+  <table>
+    <thead><tr><th>Case</th><th class="num">Time</th><th class="num">Allocations</th></tr></thead>
+    <tbody>
+      <tr><td>Request outside every rule</td><td class="num">33 ns</td><td class="num">0</td></tr>
+      <tr><td>Rule lookup, 9 entries</td><td class="num">23 ns</td><td class="num">0</td></tr>
+      <tr><td>Build a <code>402</code> with two options</td><td class="num">0.80 to 0.83 µs</td><td class="num">15</td></tr>
+      <tr><td>Decode a payment header</td><td class="num">1.6 µs</td><td class="num">11</td></tr>
+      <tr><td>Replay guard claim and release</td><td class="num">50 ns</td><td class="num">0</td></tr>
+      <tr><td>Paid request against a loopback facilitator</td><td class="num">74 to 76 µs</td><td class="num">223</td></tr>
+    </tbody>
+  </table>
+  <p>The paid-request figure includes the in-process facilitator and two loopback HTTP calls. A real facilitator adds its own round trips.</p>
+  <h3>Tests</h3>
+  <ul>
+    <li>Unit tests cover 97.4% of statements and pass with the race detector.</li>
+    <li>A Yaegi v0.16.1 harness loads the plugin the way the Traefik Plugin Catalog does and drives payment flows through the interpreted handler.</li>
+    <li>An end-to-end test runs the plugin in <code>traefik:v3.7</code> against a mock facilitator.</li>
+  </ul>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>MIT licence. Follows the <a href="https://github.com/coinbase/x402/blob/main/specs/x402-specification-v2.md">x402 v2 specification</a>. <a href="https://github.com/lukaszraczylo/traefik-x402">Source on GitHub</a>.</p>
+  </div>
+</footer>
+</body>
+</html>

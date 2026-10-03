@@ -1,6 +1,8 @@
 package traefikx402
 
 import (
+	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -18,11 +20,12 @@ func benchPlugin(b *testing.B) *Plugin {
 	b.Helper()
 	c := CreateConfig()
 	c.FacilitatorURL = "https://facilitator.invalid"
-	c.Accepts = []Accept{usdcAccept(), daiAccept()}
+	c.SupportedCheck = supportCheckOff
+	c.Accepts = []Accept{usdcAccept(), eurcAccept()}
 	c.Exact = []string{"/a", "/b", "/c", "/d"}
 	c.Prefixes = []string{"/premium/", "/paid/", "/v1/pro/"}
 	c.Suffixes = []string{".pdf", ".zip"}
-	p, err := newPlugin(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), c, "bench")
+	p, err := newPlugin(context.Background(), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), c, "bench")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -86,5 +89,42 @@ func BenchmarkReplayGuardClaim(b *testing.B) {
 		k := keys[i&1023]
 		g.claim(k, time.Second)
 		g.release(k)
+	}
+}
+
+// BenchmarkPaidRequest measures a full paid request against a facilitator on
+// loopback: one /verify and one /settle call, replay guard off so the same
+// payment repeats.
+func BenchmarkPaidRequest(b *testing.B) {
+	fac := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if r.URL.Path == "/verify" {
+			_, _ = io.WriteString(w, `{"isValid":true,"payer":"0xp"}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"success":true,"transaction":"0x1","network":"eip155:84532"}`)
+	}))
+	defer fac.Close()
+	c := CreateConfig()
+	c.FacilitatorURL = fac.URL
+	c.AllowInsecureFacilitator = true
+	c.SupportedCheck = supportCheckOff
+	c.ReplayGuard = false
+	c.Accepts = []Accept{usdcAccept()}
+	c.Prefixes = []string{"/premium/"}
+	p, err := newPlugin(context.Background(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}), c, "bench")
+	if err != nil {
+		b.Fatal(err)
+	}
+	sig := payHeader(b, usdcAccept())
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		req := httptest.NewRequest("GET", "http://h/premium/data", nil)
+		req.Header.Set(headerSignature, sig)
+		w := &discardWriter{h: http.Header{}}
+		p.ServeHTTP(w, req)
 	}
 }

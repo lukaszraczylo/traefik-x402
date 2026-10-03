@@ -103,3 +103,9 @@ func (p *Plugin) clientError(w http.ResponseWriter, reason string) {
 func (p *Plugin) serverError(w http.ResponseWriter, reason string) {
 	writeJSON(w, http.StatusInternalServerError, errorBody(reason))
 }
+
+// notImplemented answers 501: x402 defines an HTTP transport only, so a
+// protected URL cannot be reached through a protocol upgrade such as WebSocket.
+func (p *Plugin) notImplemented(w http.ResponseWriter, reason string) {
+	writeJSON(w, http.StatusNotImplemented, errorBody(reason))
+}

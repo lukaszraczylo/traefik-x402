@@ -189,7 +189,7 @@ func TestFirstMatchingRuleWins(t *testing.T) {
 	p := matchPlugin(t, func(c *Config) {
 		c.Prefixes = []string{"/api/"}
 		c.Rules = []Rule{
-			{Name: "special", Exact: []string{"/api/special"}, Accepts: []Accept{daiAccept()}, Description: "special"},
+			{Name: "special", Exact: []string{"/api/special"}, Accepts: []Accept{eurcAccept()}, Description: "special"},
 		}
 	})
 	req := httptest.NewRequest("GET", "http://h/api/special", nil)

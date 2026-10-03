@@ -1,13 +1,6 @@
 package traefikx402
 
-import (
-	"bufio"
-	"errors"
-	"net"
-	"net/http"
-)
-
-var errNoHijack = errors.New("x402: underlying writer cannot hijack")
+import "net/http"
 
 // staleEntityHeaders describe an upstream body that a failed settlement discards.
 var staleEntityHeaders = []string{
@@ -84,21 +77,6 @@ func (sw *settleWriter) Flush() {
 	if f, ok := sw.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
-}
-
-// Hijack settles first: an upgraded connection never calls WriteHeader.
-func (sw *settleWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	hj, ok := sw.ResponseWriter.(http.Hijacker)
-	if !ok {
-		return nil, nil, errNoHijack
-	}
-	if !sw.wroteHeader {
-		sw.wroteHeader = true
-		if !sw.settle() {
-			return nil, nil, errNoHijack
-		}
-	}
-	return hj.Hijack()
 }
 
 // Unwrap lets http.ResponseController reach the real writer.

@@ -74,17 +74,17 @@ func TestUnprotectedPassesThrough(t *testing.T) {
 func TestMultipleAssetsOnePath(t *testing.T) {
 	f := newFakeFacilitator(t)
 	c := baseConfig(f)
-	c.Accepts = []Accept{usdcAccept(), daiAccept()}
+	c.Accepts = []Accept{usdcAccept(), eurcAccept()}
 	p := newTestPlugin(t, c, okUpstream("ok"))
 
 	rec := do(p, "GET", "http://api.test/premium/a", nil)
 	var pr struct{ Accepts []Accept }
 	decodeHeaderJSON(t, rec.Header().Get(headerRequired), &pr)
-	if len(pr.Accepts) != 2 || pr.Accepts[0].Asset != testUSDC || pr.Accepts[1].Asset != testDAI {
+	if len(pr.Accepts) != 2 || pr.Accepts[0].Asset != testUSDC || pr.Accepts[1].Asset != testEURC {
 		t.Fatalf("accepts %+v", pr.Accepts)
 	}
 
-	for _, a := range []Accept{usdcAccept(), daiAccept()} {
+	for _, a := range []Accept{usdcAccept(), eurcAccept()} {
 		rec := do(p, "GET", "http://api.test/premium/a", map[string]string{headerSignature: payHeader(t, a)})
 		if rec.Code != 200 {
 			t.Fatalf("asset %s: status %d %s", a.Asset, rec.Code, rec.Body.String())
@@ -104,12 +104,12 @@ func TestMultipleAssetsOnePath(t *testing.T) {
 func TestPerRuleAccepts(t *testing.T) {
 	f := newFakeFacilitator(t)
 	c := baseConfig(f)
-	c.Rules = []Rule{{Name: "dai", Exact: []string{"/dai"}, Accepts: []Accept{daiAccept()}}}
+	c.Rules = []Rule{{Name: "eurc", Exact: []string{"/eurc"}, Accepts: []Accept{eurcAccept()}}}
 	p := newTestPlugin(t, c, okUpstream("ok"))
-	rec := do(p, "GET", "http://api.test/dai", nil)
+	rec := do(p, "GET", "http://api.test/eurc", nil)
 	var pr struct{ Accepts []Accept }
 	decodeHeaderJSON(t, rec.Header().Get(headerRequired), &pr)
-	if len(pr.Accepts) != 1 || pr.Accepts[0].Asset != testDAI {
+	if len(pr.Accepts) != 1 || pr.Accepts[0].Asset != testEURC {
 		t.Fatalf("accepts %+v", pr.Accepts)
 	}
 	rec = do(p, "GET", "http://api.test/premium/x", nil)
@@ -542,52 +542,18 @@ func TestInformationalStatusPassesThrough(t *testing.T) {
 	}
 }
 
-func TestWriterHijackFlushUnwrap(t *testing.T) {
+func TestWriterFlushAndUnwrap(t *testing.T) {
 	f := newFakeFacilitator(t)
-	var hijacked, unwrapped bool
+	var flushed bool
 	p := newTestPlugin(t, baseConfig(f), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rc := http.NewResponseController(w)
-		unwrapped = rc.Flush() == nil
-		conn, _, err := rc.Hijack()
-		if err == nil {
-			hijacked = true
-			_ = conn.Close()
-		}
+		flushed = http.NewResponseController(w).Flush() == nil
 	}))
-	rec := &hijackRecorder{ResponseRecorder: httptest.NewRecorder()}
-	req := httptest.NewRequest("GET", "http://api.test/premium/ws", nil)
-	req.Header.Set(headerSignature, payHeader(t, usdcAccept()))
-	p.ServeHTTP(rec, req)
-	if !unwrapped || !rec.hijacked || !hijacked {
-		t.Fatalf("flush=%v hijack=%v/%v", unwrapped, rec.hijacked, hijacked)
+	do(p, "GET", "http://api.test/premium/x", map[string]string{headerSignature: payHeader(t, usdcAccept())})
+	if !flushed {
+		t.Fatal("ResponseController could not flush through the settlement writer")
 	}
 	if _, s := f.counts(); s != 1 {
 		t.Fatalf("settle calls %d", s)
-	}
-}
-
-func TestHijackUnsupportedAndFailedSettle(t *testing.T) {
-	f := newFakeFacilitator(t)
-	var err error
-	p := newTestPlugin(t, baseConfig(f), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _, err = w.(http.Hijacker).Hijack()
-	}))
-	do(p, "GET", "http://api.test/premium/x", map[string]string{headerSignature: payHeader(t, usdcAccept())})
-	if err == nil {
-		t.Fatal("hijack on a non-hijackable writer succeeded")
-	}
-
-	f2 := newFakeFacilitator(t)
-	f2.settleResp = `{"success":false,"errorReason":"x","transaction":"","network":"n"}`
-	p2 := newTestPlugin(t, baseConfig(f2), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _, err = w.(http.Hijacker).Hijack()
-	}))
-	rec := &hijackRecorder{ResponseRecorder: httptest.NewRecorder()}
-	req := httptest.NewRequest("GET", "http://api.test/premium/x", nil)
-	req.Header.Set(headerSignature, payHeader(t, usdcAccept()))
-	p2.ServeHTTP(rec, req)
-	if err == nil || rec.hijacked || rec.Code != 402 {
-		t.Fatalf("err=%v hijacked=%v code=%d", err, rec.hijacked, rec.Code)
 	}
 }
 
@@ -681,7 +647,6 @@ func TestSettlementModeSelection(t *testing.T) {
 		{nil, "rule overrides global before", settleBefore, settleAfter, false},
 		{nil, "rule before over global after", settleAfter, settleBefore, true},
 		{map[string]string{"Accept": "text/event-stream"}, "sse forces before", settleAfter, settleAfter, true},
-		{map[string]string{"Upgrade": "websocket"}, "upgrade forces before", "", "", true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

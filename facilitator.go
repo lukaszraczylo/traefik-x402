@@ -18,18 +18,21 @@ const (
 
 // facilitator is a pooled HTTP client for a remote x402 facilitator.
 type facilitator struct {
-	client    *http.Client
-	headers   map[string]string
-	verifyURL string
-	settleURL string
+	client       *http.Client
+	signer       requestSigner
+	headers      map[string]string
+	verifyURL    string
+	settleURL    string
+	supportedURL string
 }
 
 func newFacilitator(base string, timeout time.Duration, headers map[string]string) *facilitator {
 	base = strings.TrimRight(base, "/")
 	return &facilitator{
-		verifyURL: base + "/verify",
-		settleURL: base + "/settle",
-		headers:   headers,
+		verifyURL:    base + "/verify",
+		settleURL:    base + "/settle",
+		supportedURL: base + "/supported",
+		headers:      headers,
 		client: &http.Client{
 			Timeout: timeout,
 			Transport: &http.Transport{
@@ -55,17 +58,30 @@ func requestBody(payload, requirement []byte) []byte {
 	return append(b, '}')
 }
 
-// post sends body and returns the response bytes. Any non-2xx status with an
-// unparseable body is an error; a parseable body is left for the caller to judge.
+// post sends a POST and returns the response bytes.
 func (f *facilitator) post(ctx context.Context, url string, body []byte) ([]byte, error) {
+	return f.do(ctx, http.MethodPost, url, body, true)
+}
+
+// do sends one request. A non-2xx status is an error, except that a JSON body
+// is returned to the caller when judgeErrorBody is set: verify and settle
+// report invalid payments with 4xx statuses.
+func (f *facilitator) do(ctx context.Context, method, url string, body []byte, judgeErrorBody bool) ([]byte, error) {
 	// #nosec G704 -- the facilitator URL is operator configuration, never request input
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	for k, v := range f.headers {
 		req.Header.Set(k, v)
+	}
+	if f.signer != nil {
+		if err := f.signer.sign(req); err != nil {
+			return nil, fmt.Errorf("sign facilitator request: %w", err)
+		}
 	}
 	resp, err := f.client.Do(req) // #nosec G704 -- URL comes from operator configuration
 	if err != nil {
@@ -76,7 +92,7 @@ func (f *facilitator) post(ctx context.Context, url string, body []byte) ([]byte
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode/100 != 2 && !json.Valid(data) {
+	if resp.StatusCode/100 != 2 && (!judgeErrorBody || !json.Valid(data)) {
 		return nil, fmt.Errorf("facilitator returned HTTP %d", resp.StatusCode)
 	}
 	return data, nil
