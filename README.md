@@ -58,7 +58,7 @@ experimental:
   plugins:
     x402:
       moduleName: github.com/lukaszraczylo/traefik-x402
-      version: v0.1.0   # use the latest release tag
+      version: v0.2.1   # use the latest release tag
 ```
 
 Define the middleware in a dynamic configuration. The values below are the Base
