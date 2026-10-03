@@ -105,6 +105,12 @@ func listenAll(t *testing.T, h http.Handler) (*httptest.Server, int) {
 func upstream() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case strings.HasPrefix(r.URL.Path, "/keyed/"):
+			if r.Header.Get("X-API-Key") == "" && r.Header.Get("X-Payment-Verified") != "secret" {
+				http.Error(w, "unauthenticated", http.StatusUnauthorized)
+				return
+			}
+			_, _ = fmt.Fprintf(w, "keyed ok payer=%s", r.Header.Get("X-Payer"))
 		case strings.HasSuffix(r.URL.Path, "/ws"):
 			conn, buf, err := w.(http.Hijacker).Hijack()
 			if err != nil {
@@ -186,6 +192,18 @@ func dynamicConfig(facPort, upPort int) string {
             - /premium/
           suffixes:
             - .pdf
+          paidHeaders:
+            X-Payment-Verified: secret
+          rules:
+            - name: keyed
+              prefixes:
+                - /keyed/
+              challengeStatuses:
+                - 401
+              exemptUserAgents:
+                - Googlebot
+              exemptHeaders:
+                - X-Exempt
 `, upPort, facPort, settlementMode(), usdc, payTo, eurc, payTo)
 }
 
@@ -450,6 +468,26 @@ func TestE2E(t *testing.T) {
 		}
 	})
 
+	t.Run("challenge mode separates API callers from agents", func(t *testing.T) {
+		if resp, body := get(t, base+"/keyed/data", map[string]string{"X-API-Key": "k"}); resp.StatusCode != 200 || !strings.Contains(body, "keyed ok") {
+			t.Fatalf("API caller: %d %q", resp.StatusCode, body)
+		}
+		resp, _ := get(t, base+"/keyed/data", nil)
+		if resp.StatusCode != 402 || resp.Header.Get("PAYMENT-REQUIRED") == "" {
+			t.Fatalf("agent without payment: %d", resp.StatusCode)
+		}
+		resp, body := get(t, base+"/keyed/data", map[string]string{"PAYMENT-SIGNATURE": sign(usdc, "10000", "USDC", "2", "0xkeyed")})
+		if resp.StatusCode != 200 || !strings.Contains(body, "payer="+payer) || resp.Header.Get("PAYMENT-RESPONSE") == "" {
+			t.Fatalf("paid agent: %d %q", resp.StatusCode, body)
+		}
+		if resp, _ := get(t, base+"/keyed/data", map[string]string{"X-Exempt": "1"}); resp.StatusCode != 401 {
+			t.Fatalf("exempt request must reach the upstream untouched, got %d", resp.StatusCode)
+		}
+		if resp, _ := get(t, base+"/keyed/data", map[string]string{"User-Agent": "Googlebot/2.1"}); resp.StatusCode != 401 {
+			t.Fatalf("exempt user agent must reach the upstream untouched, got %d", resp.StatusCode)
+		}
+	})
+
 	t.Run("websocket upgrade is rejected on protected paths only", func(t *testing.T) {
 		if got := upgradeStatus(t, base, "/premium/ws"); got != 501 {
 			t.Fatalf("protected: %d", got)
@@ -461,7 +499,7 @@ func TestE2E(t *testing.T) {
 
 	t.Run("facilitator saw expected traffic", func(t *testing.T) {
 		v, s := fac.counts()
-		if v < 5 || s < 4 {
+		if v < 6 || s < 5 {
 			t.Fatalf("verify=%d settle=%d", v, s)
 		}
 		fac.mu.Lock()
