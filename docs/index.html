@@ -83,6 +83,7 @@ footer { padding: 28px 0 48px; color: var(--muted); font-size: 0.92em; border-to
       <a href="#urls">URLs</a>
       <a href="#assets">Assets</a>
       <a href="#facilitator">Facilitator</a>
+      <a href="#who-pays">Who pays</a>
       <a href="#settlement">Settlement</a>
       <a href="#limits">Limits</a>
       <a href="#measured">Measured</a>
@@ -191,6 +192,16 @@ facilitatorAuth:
     </tbody>
   </table>
   <p class="src">Strict mode ran against <code>https://x402.org/facilitator</code> on 2026-10-03: it accepted Base Sepolia and Solana devnet, filled the Solana fee payer, and rejected Base mainnet, which that facilitator does not list.</p>
+</section>
+
+<section id="who-pays">
+  <h2>Decide who pays</h2>
+  <p>Existing callers can keep working while agents pay. Three options, per rule:</p>
+  <ul>
+    <li><code>exemptHeaders</code> and <code>exemptUserAgents</code> let a request through without payment. For example <code>Sec-Fetch-Mode</code>, which browsers always send, and <code>Googlebot</code>. This is a filter, not security: a client can add the header.</li>
+    <li><code>challengeStatuses: [401]</code> sends an unpaid request to the upstream first. A listed status turns into <code>402</code> with the payment requirements. Other responses pass through, so the upstream decides who must pay, for example "no valid API key".</li>
+    <li><code>payerHeader</code> and <code>paidHeaders</code> tell the upstream that a payment happened. Give a paid header a secret value so the upstream can tell it from a forged one.</li>
+  </ul>
 </section>
 
 <section id="settlement">

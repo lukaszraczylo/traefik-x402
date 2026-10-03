@@ -41,6 +41,13 @@ type Rule struct {
 	Suffixes    []string `json:"suffixes,omitempty"`
 	Methods     []string `json:"methods,omitempty"`
 	Accepts     []Accept `json:"accepts,omitempty"`
+
+	// ExemptHeaders and ExemptUserAgents let matching requests through without
+	// payment: a request is exempt when any listed header has a value or the
+	// User-Agent contains any listed substring (case-insensitive).
+	ExemptHeaders     []string `json:"exemptHeaders,omitempty"`
+	ExemptUserAgents  []string `json:"exemptUserAgents,omitempty"`
+	ChallengeStatuses []int    `json:"challengeStatuses,omitempty"`
 }
 
 // Config is the plugin configuration.
@@ -48,7 +55,11 @@ type Config struct {
 	// Accepts is the default payment list for rules that declare none.
 	// Exact, Prefixes, Suffixes, Methods, Description and MimeType form an
 	// implicit rule appended after Rules, using the default Accepts.
+	// ExemptHeaders, ExemptUserAgents and ChallengeStatuses belong to that rule
+	// too. PaidHeaders are set on the upstream request of every paid request;
+	// use a secret value so the upstream can tell a paid request from a forged one.
 	FacilitatorHeaders       map[string]string `json:"facilitatorHeaders,omitempty"`
+	PaidHeaders              map[string]string `json:"paidHeaders,omitempty"`
 	FacilitatorAuth          FacilitatorAuth   `json:"facilitatorAuth"`
 	PayerHeader              string            `json:"payerHeader,omitempty"`
 	FacilitatorTimeout       string            `json:"facilitatorTimeout,omitempty"`
@@ -59,12 +70,15 @@ type Config struct {
 	ExtensionsJSON           string            `json:"extensionsJSON,omitempty"`
 	FacilitatorURL           string            `json:"facilitatorURL,omitempty"`
 	SupportedCheck           string            `json:"supportedCheck,omitempty"`
-	Accepts                  []Accept          `json:"accepts,omitempty"`
 	Prefixes                 []string          `json:"prefixes,omitempty"`
 	Methods                  []string          `json:"methods,omitempty"`
 	Rules                    []Rule            `json:"rules,omitempty"`
 	Exact                    []string          `json:"exact,omitempty"`
 	Suffixes                 []string          `json:"suffixes,omitempty"`
+	ExemptHeaders            []string          `json:"exemptHeaders,omitempty"`
+	ExemptUserAgents         []string          `json:"exemptUserAgents,omitempty"`
+	ChallengeStatuses        []int             `json:"challengeStatuses,omitempty"`
+	Accepts                  []Accept          `json:"accepts,omitempty"`
 	ForwardPaymentHeader     bool              `json:"forwardPaymentHeader,omitempty"`
 	IgnoreCase               bool              `json:"ignoreCase,omitempty"`
 	ReplayGuard              bool              `json:"replayGuard"`
@@ -216,9 +230,29 @@ func validSettlement(s string) error {
 	return nil
 }
 
+const (
+	minChallengeStatus = 400
+	maxChallengeStatus = 599
+)
+
 func (r *Rule) validate(haveDefaultAccepts bool) error {
 	if err := validSettlement(r.Settlement); err != nil {
 		return err
+	}
+	for _, s := range r.ChallengeStatuses {
+		if s < minChallengeStatus || s > maxChallengeStatus {
+			return fmt.Errorf("challengeStatuses entry %d must be between %d and %d", s, minChallengeStatus, maxChallengeStatus)
+		}
+	}
+	for _, h := range r.ExemptHeaders {
+		if strings.TrimSpace(h) == "" {
+			return errors.New("exemptHeaders entry must not be empty")
+		}
+	}
+	for _, ua := range r.ExemptUserAgents {
+		if strings.TrimSpace(ua) == "" {
+			return errors.New("exemptUserAgents entry must not be empty")
+		}
 	}
 	if len(r.Exact)+len(r.Prefixes)+len(r.Suffixes) == 0 {
 		return errors.New("needs at least one of exact, prefixes, suffixes")
@@ -261,6 +295,10 @@ func (c *Config) allRules() []Rule {
 			Methods:     c.Methods,
 			Description: c.Description,
 			MimeType:    c.MimeType,
+
+			ExemptHeaders:     c.ExemptHeaders,
+			ExemptUserAgents:  c.ExemptUserAgents,
+			ChallengeStatuses: c.ChallengeStatuses,
 		})
 	}
 	return rules

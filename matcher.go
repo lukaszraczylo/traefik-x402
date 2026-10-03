@@ -14,6 +14,9 @@ type rule struct {
 	description string
 	mimeType    string
 	settlement  string
+	challenge   map[int]bool
+	exemptHdr   []string
+	exemptUA    []string
 	prefixes    []string
 	suffixes    []string
 	reqs        []requirement
@@ -43,6 +46,18 @@ func compileRule(r *Rule, defaults []Accept, ignoreCase bool) *rule {
 	}
 	for _, s := range r.Suffixes {
 		cr.suffixes = append(cr.suffixes, foldCase(s, ignoreCase))
+	}
+	for _, h := range r.ExemptHeaders {
+		cr.exemptHdr = append(cr.exemptHdr, http.CanonicalHeaderKey(strings.TrimSpace(h)))
+	}
+	for _, ua := range r.ExemptUserAgents {
+		cr.exemptUA = append(cr.exemptUA, strings.ToLower(strings.TrimSpace(ua)))
+	}
+	if len(r.ChallengeStatuses) > 0 {
+		cr.challenge = make(map[int]bool, len(r.ChallengeStatuses))
+		for _, s := range r.ChallengeStatuses {
+			cr.challenge[s] = true
+		}
 	}
 	if len(r.Methods) > 0 {
 		cr.methods = make(map[string]bool, len(r.Methods))
@@ -137,4 +152,22 @@ func (p *Plugin) findRule(r *http.Request) *rule {
 		}
 	}
 	return nil
+}
+
+// exempt reports whether the request may pass without payment.
+func (cr *rule) exempt(r *http.Request) bool {
+	for _, h := range cr.exemptHdr {
+		if v := r.Header[h]; len(v) > 0 && v[0] != "" {
+			return true
+		}
+	}
+	if len(cr.exemptUA) > 0 {
+		ua := strings.ToLower(r.UserAgent())
+		for _, s := range cr.exemptUA {
+			if strings.Contains(ua, s) {
+				return true
+			}
+		}
+	}
+	return false
 }

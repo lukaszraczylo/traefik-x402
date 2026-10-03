@@ -113,6 +113,7 @@ func run() int {
 	defer fac.Close()
 	flowChecks(build, fac)
 	authChecks(build, fac, auth)
+	policyChecks(build, fac)
 
 	if failures > 0 {
 		fmt.Printf("\n%d check(s) failed\n", failures)
@@ -187,6 +188,10 @@ func flowChecks(build func(map[string]interface{}) (http.Handler, error), fac *h
 }
 
 func upstreamHandler(w http.ResponseWriter, r *http.Request) {
+	if strings.HasSuffix(r.URL.Path, "/keyed") && r.Header.Get("X-API-Key") == "" && r.Header.Get("X-Payment-Verified") != "secret" {
+		http.Error(w, "unauthenticated", http.StatusUnauthorized)
+		return
+	}
 	if strings.HasSuffix(r.URL.Path, "/fail") {
 		http.Error(w, "boom", http.StatusInternalServerError)
 		return
@@ -371,4 +376,25 @@ func authChecks(build func(map[string]interface{}) (http.Handler, error), fac *h
 		"prefixes": []interface{}{pathPremium},
 	})
 	check(err != nil && strings.Contains(err.Error(), "eip155:1"), "strict mode rejects an unsupported network (%v)", err)
+}
+
+// policyChecks drives exemptions, challenge mode and paid headers.
+func policyChecks(build func(map[string]interface{}) (http.Handler, error), fac *httptest.Server) {
+	accepts := []interface{}{
+		map[string]interface{}{"network": "eip155:84532", "amount": "10000", "asset": usdc, "payTo": payTo, "extra": map[string]interface{}{"name": "USDC", "version": "2"}},
+	}
+	h, err := build(map[string]interface{}{
+		keyFacilitator: fac.URL, "allowInsecureFacilitator": true, "supportedCheck": "off", keyAccepts: accepts,
+		"prefixes": []interface{}{pathPremium}, "exemptHeaders": []interface{}{"Sec-Fetch-Mode"},
+		"exemptUserAgents": []interface{}{"Googlebot"}, "challengeStatuses": []interface{}{401},
+		"paidHeaders": map[string]interface{}{"X-Payment-Verified": "secret"},
+	})
+	must(err)
+	check(serve(h, "/premium/keyed", map[string]string{"X-API-Key": "k"}).Code == 200, "challenge: upstream accepts the caller, response passes through")
+	rec := serve(h, "/premium/keyed", nil)
+	check(rec.Code == 402 && rec.Header().Get("PAYMENT-REQUIRED") != "", "challenge: upstream 401 becomes 402 (got %d)", rec.Code)
+	rec = serve(h, "/premium/keyed", map[string]string{"PAYMENT-SIGNATURE": signatureNonce(accepts, usdc, "challenge")})
+	check(rec.Code == 200 && rec.Header().Get("PAYMENT-RESPONSE") != "", "challenge: paid request reaches the upstream with the verified header (got %d)", rec.Code)
+	check(serve(h, "/premium/data", map[string]string{"Sec-Fetch-Mode": "navigate"}).Code == 200, "exempt header passes without payment")
+	check(serve(h, "/premium/data", map[string]string{"User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1)"}).Code == 200, "exempt user agent passes without payment")
 }

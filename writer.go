@@ -88,3 +88,55 @@ func (sw *settleWriter) finish() {
 		sw.WriteHeader(http.StatusOK)
 	}
 }
+
+// challengeWriter answers a request that carries no payment. It passes the
+// upstream response through, except for the challenge statuses, which become a
+// 402 payment request. The upstream never sees a payment here.
+type challengeWriter struct {
+	http.ResponseWriter
+	p           *Plugin
+	r           *http.Request
+	cr          *rule
+	wroteHeader bool
+	converted   bool
+}
+
+func (cw *challengeWriter) WriteHeader(code int) {
+	if cw.wroteHeader {
+		return
+	}
+	if code >= 100 && code < 200 && code != http.StatusSwitchingProtocols {
+		cw.ResponseWriter.WriteHeader(code)
+		return
+	}
+	cw.wroteHeader = true
+	if !cw.cr.challenge[code] {
+		cw.ResponseWriter.WriteHeader(code)
+		return
+	}
+	cw.converted = true
+	dropEntityHeaders(cw.Header())
+	cw.p.paymentRequired(cw.ResponseWriter, cw.r, cw.cr, msgSignatureRequired)
+}
+
+func (cw *challengeWriter) Write(b []byte) (int, error) {
+	if !cw.wroteHeader {
+		cw.WriteHeader(http.StatusOK)
+	}
+	if cw.converted {
+		return len(b), nil
+	}
+	return cw.ResponseWriter.Write(b)
+}
+
+func (cw *challengeWriter) Flush() {
+	if cw.converted {
+		return
+	}
+	if f, ok := cw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Unwrap lets http.ResponseController reach the real writer.
+func (cw *challengeWriter) Unwrap() http.ResponseWriter { return cw.ResponseWriter }

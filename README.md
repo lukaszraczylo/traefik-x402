@@ -21,6 +21,7 @@ the response.
 
 Contents: [How it works](#how-it-works) ·
 [Quick start](#quick-start) · [Choose URLs](#choose-which-urls-to-protect) ·
+[Who pays](#decide-who-pays) ·
 [Assets](#offer-several-assets-for-one-url) · [Facilitator](#facilitator) ·
 [Settlement](#settlement-timing) · [Limits](#streaming-and-websocket) ·
 [Reference](#configuration-reference) · [Compliance](#x402-v2-compliance) ·
@@ -287,6 +288,42 @@ check passed for Base Sepolia (`eip155:84532`) and Solana devnet, filled the
 Solana `feePayer`, and rejected Base mainnet (`eip155:8453`). That facilitator
 lists test networks only. Run the same test: `go test -tags live -run Live .`
 
+## Decide who pays
+
+By default every request to a protected URL needs a payment. Three options keep
+existing callers working while agents pay.
+
+**Exempt requests.** A request passes without payment when it has any header in
+`exemptHeaders` (with a value) or a `User-Agent` that contains any entry of
+`exemptUserAgents` (case-insensitive):
+
+```yaml
+exemptHeaders: [Sec-Fetch-Mode]        # browsers always send it
+exemptUserAgents: [Googlebot, bingbot] # let search crawlers in
+```
+
+This is a filter, not security. A client can add the header and read for free.
+Use it to keep humans and search engines out of the paywall, not to guard
+something valuable.
+
+**Challenge on a status.** Set `challengeStatuses: [401]` and the plugin lets an
+unpaid request reach the upstream first. If the upstream answers with a listed
+status, the plugin replaces the response with `402` and the payment requirements.
+Any other response passes through untouched. The upstream decides who must pay,
+for example "no valid API key". A request that carries `PAYMENT-SIGNATURE` takes
+the normal payment path. The plugin discards the upstream body and the entity
+headers of a converted response.
+
+**Tell the upstream a payment happened.** `payerHeader` sets the payer address on
+the upstream request. `paidHeaders` sets fixed headers on every paid request.
+Give such a header a secret value (`env:` and `file:` references work), so the
+upstream can tell a paid request from a forged one. The plugin removes
+`payerHeader` from every incoming request, but it cannot remove a header on
+routes that do not use the plugin.
+
+Under Yaegi the challenge mode wraps the response writer, so it suits JSON APIs
+and not streaming responses. See [Streaming and WebSocket](#streaming-and-websocket).
+
 ## Settlement timing
 
 | `settlement` | Order | Upstream error | Best for |
@@ -349,10 +386,14 @@ request that carries a payment already in use with `402` and the reason
 | `exact`, `prefixes`, `suffixes` | none | Selectors of the implicit rule. |
 | `methods` | all but `OPTIONS` | Methods the implicit rule charges. |
 | `description`, `mimeType` | none | `resource.description` and `resource.mimeType` of the implicit rule. |
-| `rules` | none | List of rules. Each has the selectors `exact`, `prefixes`, `suffixes`, plus `methods`, `description`, `mimeType`, `accepts`, `settlement` and `name` (used in error messages). |
+| `rules` | none | List of rules. Each has the selectors `exact`, `prefixes`, `suffixes`, plus `methods`, `description`, `mimeType`, `accepts`, `settlement`, `exemptHeaders`, `exemptUserAgents`, `challengeStatuses` and `name` (used in error messages). |
 | `settlement` | `after` | `after` or `before`. |
 | `replayGuard` | `true` | Reject a payment that is already in use. |
 | `ignoreCase` | `false` | Case-insensitive path matching. |
+| `exemptHeaders` | none | Headers that let a request through without payment. |
+| `exemptUserAgents` | none | `User-Agent` substrings that let a request through. |
+| `challengeStatuses` | none | Upstream statuses (400 to 599) that become a `402`. |
+| `paidHeaders` | none | Headers set on the upstream request of every paid request. Values accept `env:` and `file:`. |
 | `payerHeader` | none | Upstream header that receives the payer address. The plugin removes any client value on every request. |
 | `forwardPaymentHeader` | `false` | Forward `PAYMENT-SIGNATURE` to the upstream. |
 | `resourceBaseURL` | derived | Fixes scheme and host in `resource.url`. Otherwise the plugin uses `X-Forwarded-Proto`, `X-Forwarded-Host` and `Host`. |

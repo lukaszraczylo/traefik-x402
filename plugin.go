@@ -23,6 +23,7 @@ type Plugin struct {
 	guard          *replayGuard
 	log            *slog.Logger
 	supportedDone  chan struct{}
+	paidHeaders    map[string]string
 	baseURL        string
 	payerHeader    string
 	extensions     []byte
@@ -53,6 +54,10 @@ func newPlugin(ctx context.Context, next http.Handler, c *Config, name string) (
 	if err != nil {
 		return nil, fmt.Errorf("x402: %w", err)
 	}
+	paid, err := resolveHeaders(c.PaidHeaders)
+	if err != nil {
+		return nil, fmt.Errorf("x402: paidHeaders: %w", err)
+	}
 	signer, err := newSigner(&c.FacilitatorAuth, time.Now)
 	if err != nil {
 		return nil, fmt.Errorf("x402: %w", err)
@@ -66,6 +71,7 @@ func newPlugin(ctx context.Context, next http.Handler, c *Config, name string) (
 		ignoreCase:     c.IgnoreCase,
 		settleBefore:   c.Settlement == settleBefore,
 		forwardPayment: c.ForwardPaymentHeader,
+		paidHeaders:    paid,
 	}
 	p.fac.signer = signer
 	if c.ExtensionsJSON != "" {
@@ -170,8 +176,18 @@ func (p *Plugin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.notImplemented(w, reasonUpgrade)
 		return
 	}
+	if cr.exempt(r) {
+		p.next.ServeHTTP(w, r)
+		return
+	}
 	sig := r.Header.Get(headerSignature)
 	if sig == "" {
+		if cr.challenge != nil {
+			// The upstream decides who needs to pay: it answers first, and a
+			// listed status turns into a payment request.
+			p.next.ServeHTTP(&challengeWriter{ResponseWriter: w, p: p, r: r, cr: cr}, r)
+			return
+		}
 		p.paymentRequired(w, r, cr, msgSignatureRequired)
 		return
 	}
@@ -220,6 +236,9 @@ func (p *Plugin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if p.payerHeader != "" && verdict.Payer != "" {
 		r.Header.Set(p.payerHeader, verdict.Payer)
+	}
+	for k, v := range p.paidHeaders {
+		r.Header.Set(k, v)
 	}
 
 	sc := &settleCtx{p: p, r: r, cr: cr, body: body}
