@@ -302,6 +302,10 @@ exemptHeaders: [Sec-Fetch-Mode]        # browsers always send it
 exemptUserAgents: [Googlebot, bingbot] # let search crawlers in
 ```
 
+A request that carries `PAYMENT-SIGNATURE` is always handled as a payment, even if
+an exemption matches. A client with a wrong API key can still pay, and a browser
+app that pays is charged.
+
 This is a filter, not security. A client can add the header and read for free.
 Use it to keep humans and search engines out of the paywall, not to guard
 something valuable.

@@ -198,7 +198,7 @@ facilitatorAuth:
   <h2>Decide who pays</h2>
   <p>Existing callers can keep working while agents pay. Three options, per rule:</p>
   <ul>
-    <li><code>exemptHeaders</code> and <code>exemptUserAgents</code> let a request through without payment. For example <code>Sec-Fetch-Mode</code>, which browsers always send, and <code>Googlebot</code>. This is a filter, not security: a client can add the header.</li>
+    <li><code>exemptHeaders</code> and <code>exemptUserAgents</code> let a request through without payment. For example <code>Sec-Fetch-Mode</code>, which browsers always send, and <code>Googlebot</code>. A request that carries a payment is always charged, even when an exemption matches. This is a filter, not security: a client can add the header.</li>
     <li><code>challengeStatuses: [401]</code> sends an unpaid request to the upstream first. A listed status turns into <code>402</code> with the payment requirements. Other responses pass through, so the upstream decides who must pay, for example "no valid API key".</li>
     <li><code>payerHeader</code> and <code>paidHeaders</code> tell the upstream that a payment happened. Give a paid header a secret value so the upstream can tell it from a forged one.</li>
   </ul>

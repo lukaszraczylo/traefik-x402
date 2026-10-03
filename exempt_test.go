@@ -41,17 +41,35 @@ func TestExemptHeadersAndUserAgents(t *testing.T) {
 	}
 }
 
-func TestExemptWinsOverPayment(t *testing.T) {
+func TestPaymentAttemptOverridesExemption(t *testing.T) {
 	f := newFakeFacilitator(t)
 	c := baseConfig(f)
-	c.ExemptHeaders = []string{"X-API-Key"}
-	p := newTestPlugin(t, c, okUpstream("free"))
-	rec := do(p, "GET", "http://api.test/premium/x", map[string]string{"X-API-Key": "k", headerSignature: payHeader(t, usdcAccept())})
-	if rec.Code != 200 || rec.Header().Get(headerResponse) != "" {
-		t.Fatalf("got %d, settlement header %q", rec.Code, rec.Header().Get(headerResponse))
+	c.ReplayGuard = false
+	c.ExemptHeaders = []string{"X-API-Key", "Sec-Fetch-Mode"}
+	var seen http.Header
+	p := newTestPlugin(t, c, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Clone()
+		_, _ = w.Write([]byte("paid"))
+	}))
+	sig := payHeader(t, usdcAccept())
+	for name, hdr := range map[string]map[string]string{
+		"wrong API key": {"X-API-Key": "wrong", headerSignature: sig},
+		"browser":       {"Sec-Fetch-Mode": "cors", headerSignature: sig},
+	} {
+		rec := do(p, "GET", "http://api.test/premium/x", hdr)
+		if rec.Code != 200 || rec.Header().Get(headerResponse) == "" {
+			t.Fatalf("%s: got %d, settlement header %q", name, rec.Code, rec.Header().Get(headerResponse))
+		}
+		if seen.Get(headerSignature) != "" {
+			t.Fatalf("%s: payment header reached the upstream", name)
+		}
 	}
-	if v, s := f.counts(); v+s != 0 {
-		t.Fatal("exempt request was charged")
+	if _, s := f.counts(); s != 2 {
+		t.Fatalf("settle calls %d, want 2: an exempt request that pays must be charged", s)
+	}
+	// Without a payment the same headers still pass free.
+	if rec := do(p, "GET", "http://api.test/premium/x", map[string]string{"X-API-Key": "k"}); rec.Code != 200 || rec.Header().Get(headerResponse) != "" {
+		t.Fatalf("unpaid exempt request: %d", rec.Code)
 	}
 }
 

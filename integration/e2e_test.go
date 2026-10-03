@@ -110,7 +110,7 @@ func upstream() http.Handler {
 				http.Error(w, "unauthenticated", http.StatusUnauthorized)
 				return
 			}
-			_, _ = fmt.Fprintf(w, "keyed ok payer=%s", r.Header.Get("X-Payer"))
+			_, _ = fmt.Fprintf(w, "keyed ok payer=%s", r.Header.Get("X-Payer")) // #nosec G705 -- mock upstream response read by the test client, not a browser
 		case strings.HasSuffix(r.URL.Path, "/ws"):
 			conn, buf, err := w.(http.Hijacker).Hijack()
 			if err != nil {

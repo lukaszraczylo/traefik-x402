@@ -176,11 +176,13 @@ func (p *Plugin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.notImplemented(w, reasonUpgrade)
 		return
 	}
-	if cr.exempt(r) {
+	sig := r.Header.Get(headerSignature)
+	// A request that offers a payment is always handled as a payment, even when
+	// it carries a header that would exempt it (a wrong API key, a browser).
+	if sig == "" && cr.exempt(r) {
 		p.next.ServeHTTP(w, r)
 		return
 	}
-	sig := r.Header.Get(headerSignature)
 	if sig == "" {
 		if cr.challenge != nil {
 			// The upstream decides who needs to pay: it answers first, and a
